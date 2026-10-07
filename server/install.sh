@@ -10,8 +10,10 @@ echo "server tools ($(git -C .. log -1 --format=%h 2>/dev/null || echo ?)):"
 
 # --- 1. validate everything first
 for f in bin/*; do
+  [ -f "$f" ] || continue
   case "$(head -1 "$f")" in
-    *python*) python3 -m py_compile "$f" ;;
+    # parse only: py_compile would leave a __pycache__ dir next to the scripts
+    *python*) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$f" ;;
     *bash*)   bash -n "$f" ;;
     *) echo "unknown interpreter in $f"; exit 1 ;;
   esac
@@ -26,6 +28,7 @@ put() {  # put <src> <dest> <mode>
   if ! cmp -s "$1" "$2"; then install -o root -g root -m "$3" "$1" "$2"; echo "  updated $2"; changed=1; fi
 }
 for f in bin/*; do
+  [ -f "$f" ] || continue
   mode=755; [ "$(basename "$f")" = pg-local-dump ] && mode=750
   put "$f" "/usr/local/bin/$(basename "$f")" "$mode"
 done
