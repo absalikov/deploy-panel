@@ -236,7 +236,7 @@ async def projects(request: Request, fetch: int = 0):
     current_user(request)
     code, out = await info("list")
     ids = json.loads(out) if code == 0 else []
-    order = ["exchange", "trxbot", "upbot", "tonwexcc", "fitness", "timeapp", "apisum"]
+    order = ["exchange", "trxbot", "upbot", "tonwexcc", "fitness", "timeapp", "apisum", "deploypanel"]
     ids.sort(key=lambda x: order.index(x) if x in order else 99)
     return await asyncio.gather(*(project_status(p, bool(fetch)) for p in ids))
 

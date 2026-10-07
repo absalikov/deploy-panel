@@ -5,6 +5,7 @@
 # commit fails the deploy (and triggers the rollback) instead of landing in /usr/local/bin.
 set -euo pipefail
 cd "$(dirname "$0")"
+echo "server tools ($(git -C .. log -1 --format=%h 2>/dev/null || echo ?)):"
 [ "$(id -u)" -eq 0 ] || { echo "install.sh must run as root"; exit 1; }
 
 # --- 1. validate everything first
