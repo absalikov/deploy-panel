@@ -1,0 +1,121 @@
+#!/bin/bash
+# deploy-info list                     → JSON array of project ids
+# deploy-info <project> status [--fetch]  → JSON: service state, deployed commit, pending commits…
+# deploy-info <project> diff [<ref>]      → unified diff deployed..ref (default origin/main), capped
+# deploy-info <project> logs [<n>]        → last n journal lines of the service
+# deploy-info <project> restart           → restart the service
+# Read-only helper for the deploy panel (runs as root via a narrow sudoers rule).
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+# systemctl-show-like output aggregated over every unit in $SERVICE (a project may run
+# several, e.g. one build serving two brands): the state is the first non-active unit's
+# (so "active" only if all are), restarts/memory/limit/CPU are summed, "since" is the
+# most recent start. Written with if-blocks only: safe under `set -e`.
+svc_show() {
+  local u k v ts active=active sub=running since=0 restarts=0 mem=0 memmax=0 cpu=0 desc=""
+  for u in $SERVICE; do
+    declare -A T=()
+    while IFS='=' read -r k v; do T[$k]="$v"; done < <(systemctl show "$u" -p ActiveState -p SubState -p ActiveEnterTimestamp -p NRestarts -p MemoryCurrent -p MemoryMax -p CPUUsageNSec -p Description)
+    if [ "$active" = active ] && [ "${T[ActiveState]}" != active ]; then active=${T[ActiveState]}; sub=${T[SubState]}; fi
+    ts=0
+    if [ -n "${T[ActiveEnterTimestamp]}" ]; then ts=$(date -d "${T[ActiveEnterTimestamp]}" +%s 2>/dev/null || echo 0); fi
+    if [ "$ts" -gt "$since" ]; then since=$ts; fi
+    if [[ "${T[NRestarts]}" =~ ^[0-9]+$ ]]; then restarts=$((restarts + T[NRestarts])); fi
+    if [[ "${T[MemoryCurrent]}" =~ ^[0-9]+$ ]]; then mem=$((mem + T[MemoryCurrent])); fi
+    if [[ "${T[MemoryMax]}" =~ ^[0-9]+$ ]]; then memmax=$((memmax + T[MemoryMax])); fi
+    if [[ "${T[CPUUsageNSec]}" =~ ^[0-9]+$ ]]; then cpu=$((cpu + T[CPUUsageNSec])); fi
+    desc="${desc:+$desc + }${T[Description]}"
+  done
+  local since_str=""; if [ "$since" -gt 0 ]; then since_str="@$since"; fi
+  printf 'ActiveState=%s\nSubState=%s\nActiveEnterTimestamp=%s\nNRestarts=%s\nMemoryCurrent=%s\nMemoryMax=%s\nCPUUsageNSec=%s\nDescription=%s\n' \
+    "$active" "$sub" "$since_str" "$restarts" "$mem" "$memmax" "$cpu" "$desc"
+}
+
+if [ "${1:-}" = metrics ]; then
+  # lightweight: one systemctl call per service, no git — used by the panel's 1-minute sampler
+  for f in /etc/deploy/*.conf; do
+    P=$(basename "$f" .conf); SERVICE=$(SERVICE=""; . "$f"; echo "$SERVICE")
+    declare -A S=()
+    while IFS='=' read -r k v; do S[$k]="$v"; done < <(svc_show)
+    printf '%s\t%s\t%s\t%s\n' "$P" "${S[ActiveState]}" "${S[CPUUsageNSec]}" "${S[MemoryCurrent]}"
+  done | jq -Rsc 'split("\n") | map(select(length>0) | split("\t") | {key:.[0], value:{active:.[1], cpu_ns:(.[2]|tonumber? // 0), memory:(.[3]|tonumber? // 0)}}) | from_entries'
+  exit 0
+fi
+if [ "${1:-}" = list ]; then
+  ls /etc/deploy/*.conf | xargs -n1 basename | sed 's/\.conf$//' | jq -R . | jq -sc .
+  exit 0
+fi
+
+P="${1:-}"; CMD="${2:-status}"
+[[ "$P" =~ ^[a-z0-9-]+$ ]] && [ -f "/etc/deploy/$P.conf" ] || { echo '{"error":"unknown project"}'; exit 2; }
+APP=""; SERVICE=""; TITLE=""; DOMAIN=""; KIND=""; ENV_TARGET=""; BACKUP_UNITS=""
+. "/etc/deploy/$P.conf"
+cd "$APP"
+export GIT_SSH_COMMAND="ssh -i /etc/deploy/keys/$P -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10"
+
+commit_json() {  # $@ = git log args
+  git log --format='%H%x1f%h%x1f%s%x1f%an%x1f%aI' "$@" | jq -R 'split("\u001f") | {sha:.[0], short:.[1], subject:.[2], author:.[3], date:.[4]}' | jq -sc .
+}
+
+case "$CMD" in
+status)
+  FETCH_ERR=""
+  if [ "${3:-}" = --fetch ]; then FETCH_ERR=$(git fetch -q origin 2>&1 | tail -1 || true); fi
+  HEAD=$(git rev-parse HEAD); REMOTE=$(git rev-parse origin/main 2>/dev/null || echo "")
+  FETCHED_AT=$(stat -c %Y .git/FETCH_HEAD 2>/dev/null || echo 0)
+  declare -A S
+  while IFS='=' read -r k v; do S[$k]="$v"; done < <(svc_show)
+  MEM=${S[MemoryCurrent]}; [[ "$MEM" =~ ^[0-9]+$ ]] || MEM=0
+  MEMMAX=${S[MemoryMax]}; [[ "$MEMMAX" =~ ^[0-9]+$ ]] || MEMMAX=0
+  CPUNS=${S[CPUUsageNSec]}; [[ "$CPUNS" =~ ^[0-9]+$ ]] || CPUNS=0
+  SSL_EXP=0
+  if [ -n "${DOMAIN:-}" ] && [ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ]; then
+    SSL_EXP=$(date -d "$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" | cut -d= -f2)" +%s 2>/dev/null || echo 0)
+  fi
+  BACKUPS='[]'
+  for B in $BACKUP_UNITS; do
+    declare -A BS=()
+    while IFS='=' read -r k v; do BS[$k]="$v"; done < <(systemctl show "$B.service" -p Result -p ExecMainExitTimestamp -p ActiveState -p Description)
+    NEXT=$(systemctl show "$B.timer" -p NextElapseUSecRealtime --value 2>/dev/null)
+    LAST=0; [ -n "${BS[ExecMainExitTimestamp]}" ] && LAST=$(date -d "${BS[ExecMainExitTimestamp]}" +%s 2>/dev/null || echo 0)
+    NEXTS=0; [ -n "$NEXT" ] && NEXTS=$(date -d "$NEXT" +%s 2>/dev/null || echo 0)
+    BACKUPS=$(jq -c --arg u "$B" --arg d "${BS[Description]}" --arg r "${BS[Result]}" --arg a "${BS[ActiveState]}" --argjson l "$LAST" --argjson n "$NEXTS"       '. + [{unit:$u, description:$d, result:$r, active:$a, last:$l, next:$n}]' <<<"$BACKUPS")
+  done
+  SINCE=0; [ -n "${S[ActiveEnterTimestamp]}" ] && SINCE=$(date -d "${S[ActiveEnterTimestamp]}" +%s 2>/dev/null || echo 0)
+  AHEAD='[]'; BEHIND=0; RECENT='[]'
+  if [ -n "$REMOTE" ]; then
+    AHEAD=$(commit_json "HEAD..origin/main" -n 50)
+    BEHIND=$(git rev-list --count "origin/main..HEAD")
+    RECENT=$(commit_json origin/main -n 25)
+  fi
+  DIRTY=$(git status --porcelain --untracked-files=no | wc -l)
+  jq -nc \
+    --arg id "$P" --arg title "${TITLE:-$P}" --arg domain "${DOMAIN:-}" --arg kind "${KIND:-}" --arg service "$SERVICE" \
+    --arg active "${S[ActiveState]}" --arg sub "${S[SubState]}" --argjson since "$SINCE" \
+    --argjson restarts "${S[NRestarts]:-0}" --argjson memory "$MEM" --argjson memmax "$MEMMAX" --argjson cpuns "$CPUNS" --argjson ssl "$SSL_EXP" --argjson backups "$BACKUPS" --arg desc "${S[Description]}" \
+    --argjson head "$(commit_json -1 "$HEAD" | jq '.[0]')" \
+    --arg remote "$REMOTE" --argjson ahead "$AHEAD" --argjson behind "$BEHIND" --argjson recent "$RECENT" \
+    --argjson dirty "$DIRTY" --argjson fetched_at "$FETCHED_AT" --arg fetch_error "$FETCH_ERR" \
+    --arg repo "$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github.com:#https://github.com/#; s#\.git$##')" \
+    '{id:$id, title:$title, domain:$domain, kind:$kind, service:$service, description:$desc,
+      state:{active:$active, sub:$sub, since:$since, restarts:$restarts, memory:$memory, memory_max:$memmax, cpu_ns:$cpuns}, ssl_expires:$ssl, backups:$backups,
+      head:$head, remote:$remote, ahead:$ahead, behind:$behind, recent:$recent,
+      dirty:$dirty, fetched_at:$fetched_at, fetch_error:$fetch_error, repo:$repo}'
+  ;;
+diff)
+  REF="${3:-origin/main}"
+  [[ "$REF" =~ ^[A-Za-z0-9/._-]+$ ]] || { echo "bad ref"; exit 2; }
+  git --no-pager diff --stat=120 HEAD "$REF" -- . ':(exclude)deploy/prod.enc.env' ':(exclude)*.lock' ':(exclude)pnpm-lock.yaml' ':(exclude)package-lock.json' | tail -40
+  echo "@@@PATCH@@@"
+  git --no-pager diff --no-color HEAD "$REF" -- . ':(exclude)deploy/prod.enc.env' ':(exclude)*.lock' ':(exclude)pnpm-lock.yaml' ':(exclude)package-lock.json' | head -c 400000
+  ;;
+logs)
+  N="${3:-150}"; [[ "$N" =~ ^[0-9]+$ ]] || N=150; (( N > 1000 )) && N=1000
+  journalctl $(for u in $SERVICE; do printf -- "-u %s " "$u"; done) -n "$N" --no-pager -o short-iso
+  ;;
+restart)
+  systemctl restart $SERVICE; sleep 5; st=active; for u in $SERVICE; do [ "$(systemctl is-active "$u")" = active ] || st=failed; done; echo "$st"
+  ;;
+*) echo '{"error":"unknown command"}'; exit 2 ;;
+esac

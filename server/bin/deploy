@@ -1,0 +1,154 @@
+#!/bin/bash
+# deploy <project> [--force] [--ref <git-ref>]
+#
+# Pulls the project's GitHub repo, decrypts deploy/prod.enc.env, installs deps / builds only
+# when the relevant files changed, restarts the service and checks it came up healthy.
+# If the health check fails, everything is rolled back to the previous commit and env.
+# Per-project settings: /etc/deploy/<project>.conf
+set -euo pipefail
+
+usage() { echo "usage: deploy <project> [--force] [--ref <git-ref>]"; echo "projects: $(ls /etc/deploy/*.conf 2>/dev/null | xargs -n1 basename | sed 's/\.conf$//' | tr '\n' ' ')"; exit 2; }
+[ $# -ge 1 ] || usage
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+# Leave the caller's cgroup: started from the deploy panel we would inherit its MemoryMax
+# (256M) and a Next.js build would crawl for tens of minutes. A transient scope keeps our
+# stdio (the panel still streams the output) but gets its own limits.
+if [ -z "${DEPLOY_SCOPED:-}" ]; then
+  export DEPLOY_SCOPED=1
+  exec systemd-run --quiet --scope --collect --unit "deploy-$(printf '%s' "$1" | tr -cd 'a-z0-9-')-$$"     -p MemoryMax=10G "$0" "$@"
+fi
+
+P="$1"; shift
+FORCE=0; REF="origin/main"; BY="${SUDO_USER:-root}"
+while [ $# -gt 0 ]; do case "$1" in --force) FORCE=1 ;; --ref) REF="$2"; shift ;; --by) BY="$2"; shift ;; *) usage ;; esac; shift; done
+[[ "$P" =~ ^[a-z0-9-]+$ ]] || usage
+[[ "$REF" =~ ^[A-Za-z0-9/._-]+$ ]] || { echo "bad ref"; exit 2; }
+[[ "$BY" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || BY=unknown
+STARTED=$(date +%s)
+CONF="/etc/deploy/$P.conf"; [ -f "$CONF" ] || { echo "no such project: $P"; usage; }
+
+# defaults, overridden by the project conf
+APP=""; OWNER=""; SERVICE=""; ENV_TARGET=""; ENV_OWNER=""; ENV_MODE=600
+DEPS_PATTERN=""; DEPS_CMD=""; BUILD_PATTERN=""; BUILD_CMD=""; PRE_RESTART_PATTERN=""; PRE_RESTART_CMD=""; PRE_RESTART_ROOT_CMD=""; ROLLING_BACK=0
+HEALTH_WAIT=15; HEALTH_LOG_REGEX=""; HEALTH_URL=""; HEALTH_HOST=""; HEALTH_EXPECT="^2"; HEALTH_URLS=""
+. "$CONF"
+
+exec 9>"/run/deploy-$P.lock"; flock -n 9 || { echo "another deploy of $P is running"; exit 1; }
+LOG=/var/log/deploy.log
+say()  { echo -e "$*"; echo "$(date -u '+%F %T') [$P] $*" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG"; }
+as_owner() { runuser -u "$OWNER" -- env HOME="$(getent passwd "$OWNER" | cut -d: -f6)" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 bash -c "$1"; }
+notify() {
+  [ -f /etc/svc-watch/telegram.env ] || return 0
+  ( . /etc/svc-watch/telegram.env
+    curl -s -m 15 -o /dev/null "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" ) || true
+}
+history() {  # $1 result: success | rolled_back | rollback_failed
+  jq -nc --arg p "$P" --arg r "$1" --arg by "$BY" --arg from "$PREV" --arg to "$TARGET" \
+    --arg subject "$(git log -1 --format=%s "$TARGET" 2>/dev/null)" \
+    --argjson ts "$STARTED" --argjson dur "$(( $(date +%s) - STARTED ))" \
+    '{ts:$ts, project:$p, result:$r, by:$by, from:$from, to:$to, subject:$subject, duration:$dur}' >> /var/log/deploy-history.jsonl
+}
+export GIT_SSH_COMMAND="ssh -i /etc/deploy/keys/$P -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+export SOPS_AGE_KEY_FILE=/etc/deploy/age.key
+cd "$APP"
+
+PREV=$(git rev-parse HEAD)
+say "fetching…"
+git fetch -q origin
+TARGET=$(git rev-parse "$REF^{commit}")
+if [ "$PREV" = "$TARGET" ] && [ $FORCE -eq 0 ]; then say "✔ $P is already at $(git log -1 --format='%h %s' "$TARGET")"; exit 0; fi
+
+CHANGED=$(git diff --name-only "$PREV" "$TARGET" || true)
+say "changes $(git rev-parse --short "$PREV") → $(git rev-parse --short "$TARGET"):"
+git --no-pager log --format='   %h %an: %s' "$PREV..$TARGET" | head -20 | tee -a "$LOG"
+matches() { [ -n "$1" ] && echo "$CHANGED" | grep -qE "$1"; }
+
+# --- snapshot for rollback
+ENV_BAK=$(mktemp); [ -n "$ENV_TARGET" ] && [ -f "$ENV_TARGET" ] && cp -p "$ENV_TARGET" "$ENV_BAK"
+declare -A RESTARTS_BEFORE=()
+snapshot_restarts() { for s in $SERVICE; do RESTARTS_BEFORE[$s]=$(systemctl show "$s" -p NRestarts --value); done; }
+snapshot_restarts
+
+apply() {  # $1 = commit. Every step checked explicitly: set -e is off inside `if`.
+  local c="$1"
+  git reset -q --hard "$c" || { say "git reset failed"; return 1; }
+  git ls-files -z | xargs -0 -r chown "$OWNER:$OWNER"; chown -R "$OWNER:$OWNER" .git
+  if [ -n "$ENV_TARGET" ] && [ -f deploy/prod.enc.env ]; then
+    local tmp; tmp=$(mktemp)
+    sops --decrypt --input-type dotenv --output-type dotenv deploy/prod.enc.env > "$tmp" || { say "env: decrypt failed"; rm -f "$tmp"; return 1; }
+    if ! cmp -s "$tmp" "$ENV_TARGET" 2>/dev/null; then
+      local keys; keys=$(diff <(sed 's/=.*//' "$ENV_TARGET" 2>/dev/null | sort) <(sed 's/=.*//' "$tmp" | sort) | sed -n 's/^< /-/p; s/^> /+/p' | tr '\n' ' ')
+      say "env: updated ${keys:-(values changed)}"
+    fi
+    install -m "$ENV_MODE" -o "${ENV_OWNER%%:*}" -g "${ENV_OWNER##*:}" "$tmp" "$ENV_TARGET" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+  fi
+  if matches "$DEPS_PATTERN" && [ -n "$DEPS_CMD" ]; then
+    say "deps: installing…"; as_owner "cd $APP && $DEPS_CMD" || { say "deps failed"; return 1; }
+  fi
+  if matches "$BUILD_PATTERN" && [ -n "$BUILD_CMD" ]; then
+    say "build: building…"; as_owner "cd $APP && $BUILD_CMD" || { say "build failed"; return 1; }
+    if [ -n "${POST_BUILD_ROOT_CMD:-}" ]; then bash -c "$POST_BUILD_ROOT_CMD" || { say "post-build failed"; return 1; }; fi
+  fi
+  # Pre-restart = DB migrations: forward-only, so never re-run while rolling back
+  # (the old code's migrate would be a no-op at best, and fails on a half-applied one).
+  if [ "$ROLLING_BACK" = 0 ] && matches "$PRE_RESTART_PATTERN"; then
+    if [ -n "$PRE_RESTART_ROOT_CMD" ]; then
+      say "pre-restart (root): $PRE_RESTART_ROOT_CMD"; bash -c "$PRE_RESTART_ROOT_CMD" || { say "pre-restart (root) failed"; return 1; }
+    fi
+    if [ -n "$PRE_RESTART_CMD" ]; then
+      say "pre-restart: $PRE_RESTART_CMD"; as_owner "cd $APP && $PRE_RESTART_CMD" || { say "pre-restart failed"; return 1; }
+    fi
+  fi
+}
+
+healthy() {
+  local since="$1"
+  sleep "$HEALTH_WAIT"
+  local s
+  for s in $SERVICE; do
+    [ "$(systemctl is-active "$s")" = active ] || { say "health: $s not active"; return 1; }
+    [ "$(systemctl show "$s" -p NRestarts --value)" = "${RESTARTS_BEFORE[$s]}" ] || { say "health: $s crashed and was restarted"; return 1; }
+  done
+  if [ -n "$HEALTH_LOG_REGEX" ]; then
+    for s in $SERVICE; do
+      journalctl -u "$s" --since "$since" --no-pager -o cat | grep -qE "$HEALTH_LOG_REGEX" || { say "health: no '$HEALTH_LOG_REGEX' in $s log"; return 1; }
+    done
+  fi
+  local check url host expect code
+  for check in $HEALTH_URLS; do
+    IFS='|' read -r url host expect <<<"$check"
+    code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' ${host:+--resolve "$host:443:127.0.0.1"} "$url" || echo 000)
+    [[ "$code" =~ ${expect:-^2} ]] || { say "health: $url → $code (want ${expect:-^2})"; return 1; }
+  done
+  if [ -n "$HEALTH_URL" ]; then
+    local code; code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' ${HEALTH_HOST:+--resolve "$HEALTH_HOST:443:127.0.0.1"} "$HEALTH_URL" || echo 000)
+    [[ "$code" =~ $HEALTH_EXPECT ]] || { say "health: $HEALTH_URL → $code (want $HEALTH_EXPECT)"; return 1; }
+  fi
+  return 0
+}
+
+restart_and_check() {
+  local since; since=$(date '+%F %T')
+  systemctl restart $SERVICE
+  healthy "$since"
+}
+
+if (apply "$TARGET" && restart_and_check); then
+  MSG="✅ deploy $P: $(git log -1 --format='%h %s' "$TARGET") ($BY)"
+  say "$MSG"; notify "$MSG"; history success
+else
+  say "✖ deploy failed — rolling back to $(git rev-parse --short "$PREV")"
+  for s in $SERVICE; do journalctl -u "$s" -n 15 --no-pager -o cat | sed "s/^/   [$s] /" | tee -a "$LOG"; done
+  CHANGED=$(git diff --name-only "$PREV" "$TARGET" || true)
+  ROLLING_BACK=1
+  apply "$PREV" || say "rollback: restoring the previous build reported errors"
+  [ -s "$ENV_BAK" ] && install -m "$ENV_MODE" -o "${ENV_OWNER%%:*}" -g "${ENV_OWNER##*:}" "$ENV_BAK" "$ENV_TARGET"
+  snapshot_restarts
+  if restart_and_check; then say "↩ rolled back, $P runs $(git rev-parse --short "$PREV") again"; ROLL="откат выполнен, работает прежняя версия"; history rolled_back
+  else say "‼ rollback also unhealthy — check: journalctl -u $SERVICE"; ROLL="ОТКАТ ТОЖЕ НЕ ПОДНЯЛСЯ — нужна ручная проверка"; history rollback_failed; fi
+  notify "❌ deploy $P ($(git rev-parse --short "$TARGET")) не прошёл проверку — $ROLL"
+  rm -f "$ENV_BAK"; exit 1
+fi
+rm -f "$ENV_BAK"

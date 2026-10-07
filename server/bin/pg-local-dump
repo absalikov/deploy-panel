@@ -1,0 +1,11 @@
+#!/bin/bash
+# pg-local-dump <db> [label] — compressed dump into /var/backups/pg/<db>/, keeps 48 h.
+# Label marks special dumps, e.g. "pre-migrate" (taken by deploy right before migrations).
+set -euo pipefail
+DB="$1"; LABEL="${2:-}"; [[ -z "$LABEL" || "$LABEL" =~ ^[a-z0-9-]+$ ]] || { echo "bad label"; exit 2; }
+D=/var/backups/pg/$DB; install -d -m 700 "$D"
+F="$D/${DB}${LABEL:+_$LABEL}_$(date -u +%Y%m%dT%H%M%SZ).dump"
+runuser -u postgres -- pg_dump -Fc -Z 6 -d "$DB" > "$F.tmp" && mv "$F.tmp" "$F"
+pg_restore --list "$F" >/dev/null
+find "$D" -name '*.dump' -mmin +2880 -delete
+echo "dumped $DB → $F ($(stat -c %s "$F") bytes)"

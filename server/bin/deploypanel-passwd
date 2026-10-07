@@ -1,0 +1,18 @@
+#!/bin/bash
+# deploypanel-passwd <username>   — set / change a deploy panel login (scrypt hash)
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+U="${1:-}"; [[ "$U" =~ ^[A-Za-z0-9._-]{2,32}$ ]] || { echo "usage: deploypanel-passwd <username>"; exit 2; }
+read -rsp "Новый пароль для $U: " P1; echo; read -rsp "Повторите: " P2; echo
+[ "$P1" = "$P2" ] || { echo "Пароли не совпадают"; exit 1; }
+[ ${#P1} -ge 10 ] || { echo "Минимум 10 символов"; exit 1; }
+PW="$P1" U="$U" python3 - <<'P'
+import hashlib, json, os, secrets
+f = "/etc/deploypanel/users.json"
+users = json.load(open(f))
+salt = secrets.token_bytes(16)
+h = hashlib.scrypt(os.environ["PW"].encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+users[os.environ["U"]] = f"scrypt${2**14}$8$1${salt.hex()}${h.hex()}"
+json.dump(users, open(f, "w"), indent=1)
+P
+echo "Готово: пароль для $U сохранён."

@@ -1,0 +1,22 @@
+[Unit]
+Description=Deploy panel (127.0.0.1:9100, via SSH tunnel)
+After=network-online.target
+
+[Service]
+User=deploypanel
+Group=deploypanel
+WorkingDirectory=/opt/deploypanel/app
+ExecStart=/opt/deploypanel/venv/bin/uvicorn app:app --host 127.0.0.1 --port 9100 --workers 1 --no-server-header --log-level warning
+SyslogIdentifier=deploypanel
+Restart=always
+RestartSec=3
+MemoryMax=256M
+# no NoNewPrivileges/ProtectSystem here: the panel launches `sudo deploy`,
+# which must be able to write to /opt/* and restart services
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+
+[Install]
+WantedBy=multi-user.target

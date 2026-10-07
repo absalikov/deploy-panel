@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""security-info — data for the deploy panel's «Защита» page (runs as root via sudo).
+
+  security-info status         → JSON: jails + bans, request stats for the last hour, top IPs, whitelist
+  security-info unban <ip>     → remove an IP from every jail
+  security-info ban <ip>       → ban an IP on all ports for a week (jail «manual»)
+"""
+import ipaddress
+import json
+import re
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from datetime import datetime
+
+ACCESS_LOG = "/var/log/nginx/access.log"
+JAILS = {
+    "sshd": "Подбор паролей SSH",
+    "nginx-scan": "Сканеры уязвимостей (wp-login, .env, .git…)",
+    "nginx-flood": "Флуд: упёрлись в лимит запросов",
+    "nginx-4xx": "Масса ошибочных запросов",
+    "manual": "Заблокированы вручную",
+}
+SCAN_RE = re.compile(r'"(?:GET|POST|HEAD|PUT|DELETE|OPTIONS) /(?:[^" ]*/)?(?:wp-login\.php|wp-admin|wp-content|wp-includes|wp-json|xmlrpc\.php|\.env|\.git/|\.aws|\.ssh|phpmyadmin|pma/|myadmin|admin\.php|cgi-bin|vendor/phpunit|boaform|HNAP1|actuator|server-status|\.DS_Store|config\.php|setup\.php|eval-stdin|\?rest_route=)')
+LINE_RE = re.compile(r'^(\S+) - \S+ \[([^\]]+)\] "([^"]*)" (\d{3}) ')
+
+
+def f2b(*args):
+    return subprocess.run(["fail2ban-client", *args], capture_output=True, text=True, timeout=20).stdout
+
+
+def whitelist():
+    for line in open("/etc/fail2ban/jail.local"):
+        if line.strip().startswith("ignoreip"):
+            return line.split("=", 1)[1].split()
+    return []
+
+
+def is_whitelisted(ip, wl):
+    try:
+        a = ipaddress.ip_address(ip)
+        return any(a in ipaddress.ip_network(n, strict=False) for n in wl)
+    except ValueError:
+        return False
+
+
+def valid_ip(ip):
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+
+def status():
+    wl = whitelist()
+    jails = []
+    for name, desc in JAILS.items():
+        out = f2b("status", name)
+        if "Currently banned" not in out:
+            continue
+        total = int(re.search(r"Total banned:\s+(\d+)", out).group(1))
+        bans = []
+        for line in f2b("get", name, "banip", "--with-time").splitlines():
+            m = re.match(r"(\S+)\s+(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \+ (\d+) = (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", line)
+            if m:
+                since = datetime.strptime(m.group(2), "%Y-%m-%d %H:%M:%S").timestamp()
+                until = datetime.strptime(m.group(4), "%Y-%m-%d %H:%M:%S").timestamp()
+                bans.append({"ip": m.group(1), "since": int(since), "until": int(until)})
+        jails.append({"name": name, "description": desc, "total": total, "banned": bans})
+
+    # request stats from the nginx access log (last hour) + top talkers (last 15 min)
+    now = time.time()
+    stats = Counter()
+    per_ip = defaultdict(lambda: {"count": 0, "limited": 0, "errors": 0, "scans": 0, "last": "", "hosts": set()})
+    try:
+        with open(ACCESS_LOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8_000_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        m = LINE_RE.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(2), "%d/%b/%Y:%H:%M:%S %z").timestamp()
+        except ValueError:
+            continue
+        if now - ts > 3600:
+            continue
+        ip, req, code = m.group(1), m.group(3), m.group(4)
+        scan = bool(SCAN_RE.search(f'"{req}"'))
+        stats["requests"] += 1
+        stats["limited"] += code == "429"
+        stats["blocked_host"] += code == "444"
+        stats["scans"] += scan
+        stats["errors"] += code.startswith("4") or code.startswith("5")
+        if now - ts <= 900:
+            d = per_ip[ip]
+            d["count"] += 1
+            d["limited"] += code == "429"
+            d["errors"] += code.startswith("4")
+            d["scans"] += scan
+            d["last"] = req[:120]
+    banned_now = {b["ip"] for j in jails for b in j["banned"]}
+    top = sorted(per_ip.items(), key=lambda kv: kv[1]["count"], reverse=True)[:12]
+    return {
+        "jails": jails,
+        "stats": dict(stats),
+        "top": [{"ip": ip, **{k: v for k, v in d.items() if k != "hosts"},
+                 "whitelisted": is_whitelisted(ip, wl), "banned": ip in banned_now} for ip, d in top],
+        "whitelist": wl,
+        "generated": int(now),
+    }
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "status":
+        print(json.dumps(status(), ensure_ascii=False))
+    elif cmd in ("unban", "ban") and len(sys.argv) == 3 and valid_ip(sys.argv[2]):
+        ip = sys.argv[2]
+        if cmd == "unban":
+            out = f2b("unban", ip).strip()
+            print(json.dumps({"ok": True, "result": out}))
+        else:
+            if is_whitelisted(ip, whitelist()):
+                print(json.dumps({"ok": False, "error": "IP в белом списке"}))
+                sys.exit(1)
+            out = f2b("set", "manual", "banip", ip).strip()
+            print(json.dumps({"ok": out == "1", "result": out}))
+    else:
+        print(json.dumps({"ok": False, "error": "usage: security-info status | ban <ip> | unban <ip>"}))
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
