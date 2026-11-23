@@ -43,6 +43,10 @@ for f in systemd/*; do
   put "$f" "/etc/systemd/system/$(basename "$f")" 644
 done
 [ $units = 1 ] && systemctl daemon-reload && echo "  systemd reloaded"
+for f in systemd/*.timer; do  # timers shipped here run on their own schedule: keep them enabled
+  [ -f "$f" ] || continue
+  t=$(basename "$f"); systemctl is-enabled -q "$t" 2>/dev/null || { systemctl enable --now "$t" && echo "  enabled $t"; }
+done
 [ $changed = 1 ] || echo "  server tools already up to date"
 
 # --- 3. the panel's own Python packages: requirements.txt → its venv, only when the file differs

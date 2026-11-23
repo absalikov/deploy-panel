@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly security digest (Mondays 07:00 UTC)
+
+[Timer]
+OnCalendar=Mon *-*-* 07:00:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

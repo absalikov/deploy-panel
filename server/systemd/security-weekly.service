@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly security digest to Telegram (updates, undeployed fixes, vulnerable deps, bans)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/security-weekly
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+
+[Unit]
+OnFailure=unit-fail-notify@%N.service

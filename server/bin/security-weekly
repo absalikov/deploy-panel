@@ -1,0 +1,89 @@
+#!/bin/bash
+# security-weekly — weekly security digest to Telegram (security-weekly.timer, Mondays).
+#   * pending package updates, highlighting security / PostgreSQL (pgdg) / Node (nodesource),
+#     which unattended-upgrades does not install by itself; reboot needed or not
+#   * fixes sitting in GitHub main that were never deployed
+#   * known vulnerabilities in production dependencies of every deployed project
+#     (npm / pnpm audit, Python venvs checked against OSV)
+#   * fail2ban: who is banned now
+# Read-only: changes nothing on the server. Run by hand: sudo security-weekly [--print]
+set -u
+PRINT=0; [ "${1:-}" = "--print" ] && PRINT=1
+lines=()
+add() { lines+=("$1"); }
+esc() { sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g'; }
+
+# --- 1. packages
+apt-get update -qq >/dev/null 2>&1
+up=$(apt list --upgradable 2>/dev/null | tail -n +2)
+n_up=$(printf '%s\n' "$up" | grep -c .)
+imp=$(printf '%s\n' "$up" | grep -E -- '-security|pgdg|nodistro' | cut -d/ -f1 | sort -u | tr '\n' ' ')
+if [ -n "$imp" ]; then add "🔴 Обновления безопасности ждут установки: ${imp}"; fi
+add "Пакетов к обновлению: ${n_up}$([ -f /var/run/reboot-required ] && echo '; нужна перезагрузка')"
+
+# --- 2. undeployed commits
+for conf in /etc/deploy/*.conf; do
+  p=$(basename "$conf" .conf)
+  ahead=$(/usr/local/bin/deploy-info "$p" status --fetch 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin).get("ahead") or []))
+except Exception: print("?")')
+  [ "$ahead" != "0" ] && add "🟡 ${p}: в main не выложено коммитов — ${ahead}"
+done
+
+# --- 3. dependencies
+for conf in /etc/deploy/*.conf; do
+  p=$(basename "$conf" .conf)
+  APP=$(. "$conf"; echo "$APP"); OWNER=$(. "$conf"; echo "$OWNER")
+  [ -d "$APP" ] || continue
+  home=$(getent passwd "$OWNER" | cut -d: -f6)
+  run() { runuser -u "$OWNER" -- env HOME="$home" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 bash -c "$1" 2>/dev/null; }
+  # npm projects (root and one level down: backend/, frontend/)
+  for lock in "$APP"/package-lock.json "$APP"/*/package-lock.json; do
+    [ -f "$lock" ] || continue
+    d=$(dirname "$lock")
+    res=$(run "cd '$d' && npm audit --omit=dev --json" | python3 -c 'import json,sys
+try:
+  v=json.load(sys.stdin)["metadata"]["vulnerabilities"]; print(v.get("critical",0), v.get("high",0), v.get("moderate",0))
+except Exception: print("? ? ?")')
+    set -- $res
+    [ "$1$2$3" != "000" ] && add "🟠 ${p} ${d#$APP/}: npm — критических $1, высоких $2, средних $3"
+  done
+  # pnpm workspace
+  if [ -f "$APP/pnpm-lock.yaml" ]; then
+    res=$(run "cd '$APP' && pnpm audit --prod --json" | python3 -c 'import json,sys
+try:
+  v=json.load(sys.stdin)["metadata"]["vulnerabilities"]; print(v.get("critical",0), v.get("high",0), v.get("moderate",0))
+except Exception: print("? ? ?")')
+    set -- $res
+    [ "$1$2$3" != "000" ] && add "🟠 ${p}: pnpm — критических $1, высоких $2, средних $3"
+  fi
+done
+# Python venvs → OSV
+for v in /opt/*/venv; do
+  [ -x "$v/bin/python" ] || continue
+  p=$(basename "$(dirname "$v")")
+  res=$("$v/bin/python" -m pip freeze --all 2>/dev/null | python3 -c '
+import json,sys,urllib.request
+pk=[l.strip().split("==",1) for l in sys.stdin if "==" in l]
+if not pk: print(""); sys.exit()
+q={"queries":[{"package":{"name":n,"ecosystem":"PyPI"},"version":ver} for n,ver in pk]}
+try:
+  r=json.load(urllib.request.urlopen(urllib.request.Request("https://api.osv.dev/v1/querybatch",json.dumps(q).encode(),{"Content-Type":"application/json"}),timeout=60))
+  bad=[f"{n}=={ver}" for (n,ver),x in zip(pk,r["results"]) if x.get("vulns")]
+  print(" ".join(bad))
+except Exception: print("? (OSV недоступен)")')
+  [ -n "$res" ] && add "🟠 ${p}: Python — уязвимые пакеты: ${res}"
+done
+
+# --- 4. fail2ban
+f2b=$(for j in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:\s*//p' | tr ',' ' '); do
+  c=$(fail2ban-client status "$j" | sed -n 's/.*Currently banned:\s*//p'); [ "${c:-0}" != 0 ] && printf '%s %s, ' "$j" "$c"; done)
+add "fail2ban, забанено сейчас: ${f2b:-никого}"
+
+text="🛡 <b>Безопасность $(hostname), $(date +%d.%m.%Y)</b>
+$(printf '%s\n' "${lines[@]}" | esc | head -c 3500)"
+if [ $PRINT = 1 ] || [ ! -f /etc/svc-watch/telegram.env ]; then printf '%s\n' "$text"; exit 0; fi
+. /etc/svc-watch/telegram.env
+curl -s -m 20 -o /dev/null "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+  --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "parse_mode=HTML" --data-urlencode "text=${text}"
