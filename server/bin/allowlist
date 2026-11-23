@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""allowlist — who may open a site that is closed by IP (runs as root via sudo from the panel).
+
+A site is closed by IP when nginx includes /etc/nginx/allowlists/<site>.conf in its server block;
+that file holds `allow <ip|cidr>;  # comment` lines and ends with `deny all;`.
+
+  allowlist list                       → JSON: sites with their entries + IPs of current SSH sessions
+  allowlist add <site> <ip|cidr> [comment]
+  allowlist remove <site> <ip|cidr>
+
+Every change is checked with `nginx -t` before nginx is reloaded; if the check fails the previous
+file is put back. An empty list means nobody gets in (deny all) — the panel warns about that.
+"""
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+DIR = "/etc/nginx/allowlists"
+LOCK = "/run/allowlist.lock"
+SITE_RE = re.compile(r"^[a-z0-9-]+$")
+ALLOW_RE = re.compile(r"^\s*allow\s+([0-9A-Fa-f:./]+)\s*;\s*(?:#\s*(.*))?$")
+
+
+def out(obj, code=0):
+    print(json.dumps(obj, ensure_ascii=False))
+    sys.exit(code)
+
+
+def fail(msg):
+    out({"ok": False, "error": msg}, 1)
+
+
+def conf_value(site, key):
+    path = f"/etc/deploy/{site}.conf"
+    if not os.path.exists(path):
+        return ""
+    r = subprocess.run(["bash", "-c", f". {shlex.quote(path)} >/dev/null 2>&1; printf %s \"${key}\""],
+                       capture_output=True, text=True, timeout=10)
+    return r.stdout.strip()
+
+
+def read_entries(site):
+    entries = []
+    with open(os.path.join(DIR, f"{site}.conf"), encoding="utf-8") as f:
+        for line in f:
+            m = ALLOW_RE.match(line)
+            if m:
+                entries.append({"ip": m.group(1), "comment": (m.group(2) or "").strip()})
+    return entries
+
+
+def sites():
+    if not os.path.isdir(DIR):
+        return []
+    return sorted(f[:-5] for f in os.listdir(DIR) if f.endswith(".conf") and SITE_RE.match(f[:-5]))
+
+
+def ssh_ips():
+    r = subprocess.run(["who", "--ips"], capture_output=True, text=True, timeout=10).stdout
+    ips = []
+    for line in r.splitlines():
+        last = line.split()[-1] if line.split() else ""
+        try:
+            a = ipaddress.ip_address(last.strip("()"))
+        except ValueError:
+            continue
+        if not a.is_loopback and str(a) not in ips:
+            ips.append(str(a))
+    return ips
+
+
+def norm_net(value):
+    try:
+        net = ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        fail("Некорректный IP или подсеть")
+    if net.prefixlen == 0:
+        fail("Нельзя открыть сайт для всего интернета через список")
+    if net.num_addresses == 1:
+        return str(net.network_address)
+    return str(net)
+
+
+def clean_comment(text):
+    text = re.sub(r"[\r\n#;]", " ", text or "").strip()
+    return text[:60]
+
+
+def write(site, entries):
+    path = os.path.join(DIR, f"{site}.conf")
+    old = open(path, encoding="utf-8").read()
+    title = conf_value(site, "DOMAIN") or site
+    lines = [f"# Who may open {title}. Managed by the deploy panel («Защита» → «Доступ по IP»).",
+             "# One `allow <ip or cidr>;` per line; everything else is denied."]
+    for e in entries:
+        lines.append(f"allow {e['ip']};" + (f"   # {e['comment']}" if e["comment"] else ""))
+    lines.append("deny all;")
+    tmp = path + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    t = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=30)
+    if t.returncode != 0:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(old)
+        fail("nginx отклонил изменение, список возвращён как был: " + t.stderr.strip()[-200:])
+    r = subprocess.run(["systemctl", "reload", "nginx"], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        fail("nginx не перечитал настройки: " + r.stderr.strip()[-200:])
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        fail("usage: allowlist list | add <site> <ip> [comment] | remove <site> <ip>")
+    cmd = args[0]
+    if cmd == "list":
+        out({"ok": True,
+             "sites": [{"id": s, "domain": conf_value(s, "DOMAIN"), "title": conf_value(s, "TITLE") or s,
+                        "service": conf_value(s, "SERVICE"), "entries": read_entries(s)} for s in sites()],
+             "ssh_ips": ssh_ips()})
+    if cmd not in ("add", "remove") or len(args) < 3:
+        fail("unknown command")
+    site = args[1]
+    if not SITE_RE.match(site) or site not in sites():
+        fail("Такого сайта со списком доступа нет")
+    net = norm_net(args[2])
+    with open(LOCK, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        entries = read_entries(site)
+        if cmd == "add":
+            if any(e["ip"] == net for e in entries):
+                fail(f"{net} уже в списке")
+            entries.append({"ip": net, "comment": clean_comment(" ".join(args[3:]))})
+        else:
+            if not any(e["ip"] == net for e in entries):
+                fail(f"{net} нет в списке")
+            entries = [e for e in entries if e["ip"] != net]
+        write(site, entries)
+    out({"ok": True, "site": site, "entries": entries})
+
+
+if __name__ == "__main__":
+    main()

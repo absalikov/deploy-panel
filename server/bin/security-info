@@ -20,6 +20,8 @@ JAILS = {
     "nginx-scan": "Сканеры уязвимостей (wp-login, .env, .git…)",
     "nginx-flood": "Флуд: упёрлись в лимит запросов",
     "nginx-4xx": "Масса ошибочных запросов",
+    "nginx-auth": "Подбор паролей на сайтах",
+    "recidive": "Повторные нарушители",
     "manual": "Заблокированы вручную",
 }
 SCAN_RE = re.compile(r'"(?:GET|POST|HEAD|PUT|DELETE|OPTIONS) /(?:[^" ]*/)?(?:wp-login\.php|wp-admin|wp-content|wp-includes|wp-json|xmlrpc\.php|\.env|\.git/|\.aws|\.ssh|phpmyadmin|pma/|myadmin|admin\.php|cgi-bin|vendor/phpunit|boaform|HNAP1|actuator|server-status|\.DS_Store|config\.php|setup\.php|eval-stdin|\?rest_route=)')

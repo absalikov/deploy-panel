@@ -568,6 +568,8 @@ const JAIL_RULES = {
   'nginx-4xx': '60 ошибочных запросов (400–404, 444) за минуту → бан на час',
   'sshd': '5 неудачных входов по SSH за 10 минут → бан на час',
   'manual': 'заблокированы вами из панели → на неделю, все порты',
+  'nginx-auth': '8 неудачных входов (тайм-трекер, вход в обменники) за 10 минут → бан на сутки',
+  'recidive': '3 бана за сутки в любых правилах → бан на 4 недели, все порты',
 };
 const until = (ts) => { const d = ts - Date.now() / 1000; return d <= 0 ? 'истекает' : d < 3600 ? `ещё ${Math.ceil(d / 60)} мин` : d < 86400 ? `ещё ${Math.round(d / 3600)} ч` : `ещё ${Math.round(d / 86400)} дн`; };
 async function renderSecurity() {
@@ -577,12 +579,55 @@ async function renderSecurity() {
   bindNav();
   $('#secRefresh').onclick = () => loadSecurity(true);
   await loadSecurity();
-  state.timer = setInterval(() => { if (!$('.sheet')) loadSecurity(); }, 30e3);
+  // auto-refresh, but never while you are typing an address into the access lists
+  state.timer = setInterval(() => { const a = document.activeElement; if (!$('.sheet') && !(a && a.closest && a.closest('#allowlists'))) loadSecurity(); }, 30e3);
 }
 async function loadSecurity(spin) {
   const b = $('#secRefresh'); if (spin && b) b.classList.add('spin');
-  try { paintSecurity(await api('/api/security')); } catch (e) { if (e.message !== 'login') toast(e.message, 'bad'); }
+  try {
+    const [sec, allow] = await Promise.all([api('/api/security'), api('/api/allowlists').catch((e) => ({ error: e.message, sites: [] }))]);
+    paintSecurity(sec); paintAllowlists(allow);
+  } catch (e) { if (e.message !== 'login') toast(e.message, 'bad'); }
   finally { b && b.classList.remove('spin'); }
+}
+function paintAllowlists(d) {
+  const box = $('#sec'); if (!box) return;
+  const sites = d.sites || [], mine = d.ssh_ips || [];
+  if (!sites.length && !d.error) return;
+  const el = document.createElement('div');
+  el.className = 'panel'; el.style.marginTop = '12px'; el.id = 'allowlists';
+  el.innerHTML = `<div class="card-h"><h3>Доступ к сайтам по IP</h3><span class="t3" style="font-size:12.5px">остальным сайт отвечает 403</span></div>
+    ${d.error ? `<div class="empty"><p>${esc(d.error)}</p></div>` : sites.map((s) => `<div class="rules" data-site="${esc(s.id)}">
+        <div class="t" style="font-weight:600">${esc(s.title)}${s.domain ? ` <span class="t3 mono" style="font-weight:500">· ${esc(s.domain)}</span>` : ''}</div>
+        ${s.entries.length ? `<div class="stable">${s.entries.map((e) => `<div class="srow">
+            <div class="ipcell"><span class="ip">${esc(e.ip)}</span>${mine.includes(e.ip) ? '<span class="chip ok">вы сейчас</span>' : ''}</div>
+            <div class="grow"><div class="t3" style="font-size:12.5px">${esc(e.comment || '—')}</div></div>
+            <button class="btn sm" data-allow-del="${esc(e.ip)}">${ic.x}Убрать</button></div>`).join('')}</div>`
+          : `<div class="note">${ic.alert}<div>Список пуст — сайт закрыт для всех.</div></div>`}
+        <form class="allow-add" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <input name="ip" placeholder="IP или подсеть, например 1.2.3.4" required style="flex:1 1 180px" autocomplete="off">
+          <input name="comment" placeholder="Кто это (необязательно)" maxlength="60" style="flex:1 1 180px" autocomplete="off">
+          <button class="btn sm" type="submit">${ic.check}Добавить</button>
+        </form>
+        ${mine.filter((ip) => !s.entries.some((e) => e.ip === ip)).map((ip) => `<button class="btn sm ghost" data-allow-mine="${esc(ip)}" style="margin-top:6px">Добавить мой текущий IP ${esc(ip)}</button>`).join('')}
+      </div>`).join('<hr style="border:none;border-top:1px solid rgba(127,127,127,.2);margin:14px 0">')}
+    <div class="note">${ic.info}<div>«Мой текущий IP» — адрес, с которого сейчас открыто SSH-подключение к серверу (через него работает панель). Домашний и мобильный IP меняются: если сайт перестал открываться, добавьте новый адрес здесь.</div></div>`;
+  const old = $('#allowlists'); old ? old.replaceWith(el) : box.prepend(el);
+  const send = async (site, action, ip, comment) => {
+    try { await api(`/api/allowlists/${encodeURIComponent(site)}/${action}`, { json: { ip, comment } }); toast(action === 'add' ? `${ip} добавлен` : `${ip} убран`); loadSecurity(); }
+    catch (e) { toast(e.message, 'bad'); loadSecurity(); }
+  };
+  $$('[data-site]', el).forEach((wrap) => {
+    const site = wrap.dataset.site, count = $$('[data-allow-del]', wrap).length;
+    $$('[data-allow-del]', wrap).forEach((b) => (b.onclick = () => {
+      const ip = b.dataset.allowDel;
+      const warn = count === 1 ? '\n\nЭто последний адрес — сайт закроется для всех.' : mine.includes(ip) ? '\n\nЭто ваш текущий адрес — у вас сайт тоже перестанет открываться.' : '';
+      if (confirm(`Убрать ${ip} из списка?${warn}`)) { b.disabled = true; send(site, 'remove', ip); }
+    }));
+    $$('[data-allow-mine]', wrap).forEach((b) => (b.onclick = () => { b.disabled = true; send(site, 'add', b.dataset.allowMine, `мой IP, ${new Date().toLocaleDateString('ru')}`); }));
+    const f = $('.allow-add', wrap);
+    f.onsubmit = (ev) => { ev.preventDefault(); const fd = new FormData(f); send(site, 'add', String(fd.get('ip')).trim(), String(fd.get('comment') || '').trim()); };
+  });
 }
 function paintSecurity(d) {
   const box = $('#sec'); if (!box) return;
@@ -616,7 +661,7 @@ function paintSecurity(d) {
         <div class="note">${ic.info}<div>Повторным нарушителям срок бана каждый раз растёт — до недели. Обычные посетители до лимитов не доходят: открытие страницы — это 5–15 запросов.</div></div></div></div>
       <div class="panel"><div class="card-h"><h3>Белый список</h3></div><div class="rules">
         <div class="chips">${d.whitelist.map((w) => `<span class="chip ok mono">${esc(w)}</span>`).join('')}</div>
-        <div class="note">${ic.info}<div>Эти адреса никогда не блокируются и не ограничиваются: сам сервер, твой ноутбук, старый сервер и сети Telegram (вебхуки). Если у тебя сменился IP — скажи, добавлю новый.</div></div>
+        <div class="note">${ic.info}<div>Эти адреса никогда не блокируются и не ограничиваются: сам сервер, сети Telegram (вебхуки) и парсеры BestChange.</div></div>
         <div class="note">${ic.alert}<div>Это защита уровня приложения. От объёмной DDoS-атаки (гигабиты трафика) помогает базовая защита netcup, а для серьёзной — Cloudflare перед сайтами.</div></div></div></div>
     </div>`;
   $$('[data-unban]', box).forEach((b) => (b.onclick = async () => {

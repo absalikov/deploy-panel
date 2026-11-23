@@ -319,6 +319,45 @@ async def security_action(action: str, request: Request):
     return r
 
 
+# ---------------------------------------------------------------- sites closed by IP (nginx allow/deny)
+async def allowlist(*args: str) -> dict:
+    code, out = await run("sudo", "-n", "/usr/local/bin/allowlist", *args, timeout=40)
+    try:
+        r = json.loads(out)
+    except ValueError:
+        raise HTTPException(500, out[-300:] or "allowlist failed")
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error") or "Не получилось")
+    return r
+
+
+def check_net(value: str) -> str:
+    try:
+        net = ipaddress.ip_network(str(value).strip(), strict=False)
+    except ValueError:
+        raise HTTPException(400, "Некорректный IP или подсеть")
+    return str(net.network_address) if net.num_addresses == 1 else str(net)
+
+
+@app.get("/api/allowlists")
+async def allowlists(request: Request):
+    current_user(request)
+    return await allowlist("list")
+
+
+@app.post("/api/allowlists/{site}/{action}")
+async def allowlist_action(site: str, action: str, request: Request):
+    user = mutation_guard(request)
+    if action not in ("add", "remove") or not PROJECT_RE.match(site):
+        raise HTTPException(404, "unknown action")
+    body = await request.json()
+    net = check_net(body.get("ip", ""))
+    if action == "add":
+        comment = " ".join(str(body.get("comment", "")).split())[:60] or f"добавил {user}"
+        return await allowlist("add", site, net, comment)
+    return await allowlist("remove", site, net)
+
+
 # ---------------------------------------------------------------- deploy jobs
 async def run_job(job: dict, args: list[str]):
     proc = await asyncio.create_subprocess_exec(
