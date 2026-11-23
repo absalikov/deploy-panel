@@ -61,7 +61,7 @@ if [ "$PREV" = "$TARGET" ] && [ $FORCE -eq 0 ]; then say "✔ $P is already at $
 
 CHANGED=$(git diff --name-only "$PREV" "$TARGET" || true)
 say "changes $(git rev-parse --short "$PREV") → $(git rev-parse --short "$TARGET"):"
-git --no-pager log --format='   %h %an: %s' "$PREV..$TARGET" | head -20 | tee -a "$LOG"
+git --no-pager log --format='   %h %an: %s' -n 20 "$PREV..$TARGET" | tee -a "$LOG"
 matches() { [ -n "$1" ] && echo "$CHANGED" | grep -qE "$1"; }
 
 # --- snapshot for rollback
