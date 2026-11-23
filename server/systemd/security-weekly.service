@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/security-weekly
+# via bash: install.sh verifies units before it installs bin/, when the script is not there yet
+ExecStart=/bin/bash /usr/local/bin/security-weekly
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=30min
