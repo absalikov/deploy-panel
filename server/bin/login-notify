@@ -1,0 +1,88 @@
+#!/bin/bash
+# login-notify — a Telegram message for every login to this server (runs as root).
+#
+#   from PAM, /etc/pam.d/sshd:  session optional pam_exec.so quiet /usr/local/bin/login-notify
+#                               (PAM_TYPE, PAM_USER, PAM_RHOST, PAM_SERVICE come from pam_exec)
+#   from the deploy panel:      sudo login-notify panel <user> ok|fail|locked
+#
+# It must never block or break a login: it always exits 0 and sends in the background.
+# Every `ssh host cmd` opens a session, so repeats are folded: the same user from a known address
+# (a panel IP allowlist or fail2ban's ignoreip) is reported once per 12 h, from any other address
+# once per hour, marked as unknown.
+# Chat and token: /etc/svc-watch/telegram.env (TG_TOKEN, TG_CHAT), like the other alerts.
+
+STATE=/run/login-notify
+HOST=$(hostname -s)
+
+clean() { printf '%s' "$1" | tr -cd '[:alnum:]._@:-' | cut -c1-64; }
+
+known() {  # known <ip> → prints how the address is known and returns 0, or returns 1
+  # known = in an IP allowlist of the panel (/etc/nginx/allowlists, with its comment) or in fail2ban's ignoreip
+  timeout 5 python3 -I - "$1" <<'PY' 2>/dev/null
+import glob, ipaddress, re, sys
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+    for path in sorted(glob.glob("/etc/nginx/allowlists/*.conf")):
+        for line in open(path, encoding="utf-8"):
+            m = re.match(r"\s*allow\s+([0-9A-Fa-f:./]+)\s*;\s*(?:#\s*(.*))?$", line)
+            if m and ip in ipaddress.ip_network(m.group(1), strict=False):
+                print("список доступа" + (f": {m.group(2).strip()[:60]}" if m.group(2) else ""))
+                sys.exit(0)
+    nets = next((l.split("=", 1)[1].split() for l in open("/etc/fail2ban/jail.local")
+                 if l.strip().startswith("ignoreip")), [])
+    if any(ip in ipaddress.ip_network(n, strict=False) for n in nets):
+        print("белый список fail2ban")
+        sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+PY
+}
+
+seen_recently() {  # seen_recently <key> <seconds> → 0 when already reported that recently; marks it otherwise
+  install -d -m 700 "$STATE" 2>/dev/null || return 1
+  local f="$STATE/$(printf '%s' "$1" | sha1sum | cut -c1-16)"
+  if [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt "$2" ]; then return 0; fi
+  touch "$f"; return 1
+}
+
+send() {  # send <text> — detached, so the caller returns at once
+  [ -r /etc/svc-watch/telegram.env ] || return 0
+  # shellcheck disable=SC1091
+  . /etc/svc-watch/telegram.env
+  [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ] || return 0
+  setsid -f timeout 20 curl -s -o /dev/null --data-urlencode "chat_id=${TG_CHAT}" \
+    --data-urlencode "text=$1" --data "disable_web_page_preview=true" \
+    "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" </dev/null >/dev/null 2>&1
+}
+
+WHEN=$(TZ=Asia/Tbilisi date '+%d.%m.%Y %H:%M')
+
+if [ "${1:-}" = panel ]; then
+  USR=$(clean "${2:-}"); OUTCOME="${3:-}"
+  case "$OUTCOME" in
+    ok)     seen_recently "panel|$USR" 43200 && exit 0
+            send "🔑 Вход в панель деплоя: ${USR}
+${HOST}, ${WHEN} (Тбилиси)" ;;
+    fail)   send "⚠️ Неверный пароль в панели деплоя для «${USR}»
+${HOST}, ${WHEN} (Тбилиси). Панель открыта только через SSH-туннель — значит, это кто-то с доступом к серверу." ;;
+    locked) send "🚫 Панель деплоя: 5 неверных паролей подряд для «${USR}», вход закрыт на 10 минут
+${HOST}, ${WHEN} (Тбилиси)" ;;
+  esac
+  exit 0
+fi
+
+# PAM: report only opened SSH sessions
+[ "${PAM_TYPE:-}" = open_session ] || exit 0
+[ "${PAM_SERVICE:-}" = sshd ] || exit 0
+USR=$(clean "${PAM_USER:-?}"); IP=$(clean "${PAM_RHOST:-?}")
+if LABEL=$(known "$IP"); then
+  seen_recently "ssh|$USR|$IP" 43200 && exit 0
+  send "🔑 Вход по SSH: ${USR} с ${IP} (${LABEL})
+${HOST}, ${WHEN} (Тбилиси). Повторные входы с этого адреса — не чаще раза в 12 ч."
+else
+  seen_recently "ssh|$USR|$IP" 3600 && exit 0
+  send "⚠️ Вход по SSH с незнакомого адреса: ${USR} с ${IP}
+${HOST}, ${WHEN} (Тбилиси). Если это не вы — заблокируйте адрес в панели («Защита») и смените ключи."
+fi
+exit 0

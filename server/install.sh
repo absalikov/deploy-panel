@@ -48,6 +48,11 @@ for f in systemd/*.timer; do  # timers shipped here run on their own schedule: k
   t=$(basename "$f"); systemctl is-enabled -q "$t" 2>/dev/null || { systemctl enable --now "$t" && echo "  enabled $t"; }
 done
 [ $changed = 1 ] || echo "  server tools already up to date"
+# SSH login alerts (login-notify). `optional` + a script that always exits 0: it never blocks a login.
+PAM_LINE='session optional pam_exec.so quiet /usr/local/bin/login-notify'
+if [ -x /usr/local/bin/login-notify ] && ! grep -qxF "$PAM_LINE" /etc/pam.d/sshd; then
+  printf '%s\n' "$PAM_LINE" >> /etc/pam.d/sshd && echo "  enabled SSH login alerts"
+fi
 
 # --- 3. the panel's own Python packages: requirements.txt → its venv, only when the file differs
 #        from what was installed there last time. Checked by importing the new app.py; on any

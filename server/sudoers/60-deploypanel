@@ -1,2 +1,2 @@
-deploypanel ALL=(root) NOPASSWD: /usr/local/bin/deploy, /usr/local/bin/deploy-info, /usr/local/bin/security-info, /usr/local/bin/allowlist
+deploypanel ALL=(root) NOPASSWD: /usr/local/bin/deploy, /usr/local/bin/deploy-info, /usr/local/bin/security-info, /usr/local/bin/allowlist, /usr/local/bin/login-notify
 Defaults:deploypanel !requiretty

@@ -123,6 +123,21 @@ def read_history(project: str | None = None, limit: int = 50) -> list[dict]:
 
 
 # ---------------------------------------------------------------- auth
+_notify_tasks: set = set()
+
+
+def notify_login(user: str, outcome: str) -> None:
+    # Telegram alert via login-notify (root-only chat token); fire-and-forget, never delays or fails a login
+    async def go():
+        try:
+            await run("sudo", "-n", "/usr/local/bin/login-notify", "panel", user, outcome, timeout=15)
+        except Exception:
+            pass
+    task = asyncio.create_task(go())
+    _notify_tasks.add(task)
+    task.add_done_callback(_notify_tasks.discard)
+
+
 @app.post("/api/login")
 async def login(request: Request, response: Response):
     body = await request.json()
@@ -134,9 +149,11 @@ async def login(request: Request, response: Response):
     users = json.loads(USERS_FILE.read_text()) if USERS_FILE.exists() else {}
     if user not in users or not verify_password(users[user], pw):
         failed_logins[user] = fails + [now]
+        notify_login(user, "locked" if len(fails) + 1 >= 5 else "fail")
         await asyncio.sleep(1)
         raise HTTPException(401, "Неверный логин или пароль")
     failed_logins.pop(user, None)
+    notify_login(user, "ok")
     tok = secrets.token_urlsafe(32)
     sessions[tok] = {"user": user, "exp": now + SESSION_TTL}
     response.set_cookie("dp_session", tok, max_age=SESSION_TTL, httponly=True, samesite="strict", secure=SECURE_COOKIE)
