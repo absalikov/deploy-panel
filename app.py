@@ -15,6 +15,7 @@ import secrets
 import shutil
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -29,7 +30,17 @@ SECURE_COOKIE = os.getenv("PANEL_SECURE_COOKIE", "0") == "1"
 PROJECT_RE = re.compile(r"^[a-z0-9-]+$")
 REF_RE = re.compile(r"^[A-Za-z0-9/._-]{1,100}$")
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # resource history sampler (load_metrics/sampler are defined below)
+    load_metrics()
+    task = asyncio.create_task(sampler())
+    yield
+    task.cancel()
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 sessions: dict[str, dict] = {}          # token -> {user, exp}
 failed_logins: dict[str, list[float]] = {}
 jobs: dict[str, dict] = {}              # job id -> {project, lines, done, result, listeners, ...}
@@ -223,12 +234,6 @@ async def sampler():
         except Exception:
             pass
         await asyncio.sleep(60)
-
-
-@app.on_event("startup")
-async def start_sampler():
-    load_metrics()
-    asyncio.create_task(sampler())
 
 
 @app.get("/api/projects")

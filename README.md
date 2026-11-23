@@ -12,6 +12,7 @@ logs, metrics, security (fail2ban bans). FastAPI + vanilla JS, no build step.
 | `server/bin/pg-local-dump` | 30-min and pre-migration PostgreSQL dumps (48 h) | `/usr/local/bin/` |
 | `server/bin/deploypanel-passwd` | set a panel login | `/usr/local/bin/` |
 | `server/systemd/`, `server/sudoers/` | panel service and its sudo rights | `/etc/systemd/system/`, `/etc/sudoers.d/` |
+| `server/requirements.txt` | the panel's Python packages, all pinned | `/opt/deploypanel/venv` |
 
 ## Workflow
 
@@ -20,8 +21,10 @@ logs, metrics, security (fail2ban bans). FastAPI + vanilla JS, no build step.
 
 Deploy restarts the panel (the page reconnects in a few seconds). If anything under
 `server/` changed, `server/install.sh` syntax-checks every file and installs only the changed
-ones. If the panel doesn't come back up, deploy rolls back to the previous commit,
-including the server tools.
+ones; when `server/requirements.txt` differs from what the venv last got, it installs it with
+pip and imports `app.py` as a check, putting the previous packages back if that fails.
+If the panel doesn't come back up, deploy rolls back to the previous commit,
+including the server tools (but not the Python packages).
 
 Per-project settings live on the server in `/etc/deploy/<project>.conf` (not in this repo).
 
