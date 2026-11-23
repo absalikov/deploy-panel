@@ -61,12 +61,20 @@ def sites():
 
 
 def ssh_ips():
-    r = subprocess.run(["who", "--ips"], capture_output=True, text=True, timeout=10).stdout
+    # peers of established SSH connections — includes tunnels (`ssh -N -L 9100:…`), which have no
+    # terminal and therefore never show up in `who`
+    r = subprocess.run(["ss", "-tnH", "state", "established", "( sport = :22 )"],
+                       capture_output=True, text=True, timeout=10).stdout
     ips = []
     for line in r.splitlines():
-        last = line.split()[-1] if line.split() else ""
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        peer = cols[-1].rsplit(":", 1)[0].strip("[]")
+        if peer.startswith("::ffff:"):
+            peer = peer[7:]
         try:
-            a = ipaddress.ip_address(last.strip("()"))
+            a = ipaddress.ip_address(peer)
         except ValueError:
             continue
         if not a.is_loopback and str(a) not in ips:
